@@ -56,11 +56,7 @@ def init_db():
                     created_at TEXT NOT NULL
                 )
             """)
-            # Add this for existing databases
-cur.execute("""
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS password TEXT
-""")
+    
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower ON users (LOWER(username))")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_settings (
@@ -123,7 +119,7 @@ def create_user(username, password):
         with get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO users (username,password, password_hash, password_salt, created_at) VALUES (%s, %s, %s, %s) RETURNING id",
+                    "INSERT INTO users (username, password_hash, password_salt, created_at) VALUES (%s, %s, %s, %s) RETURNING id",
                     (username, password_hash, salt, now),
                 )
                 user_id = cur.fetchone()["id"]
