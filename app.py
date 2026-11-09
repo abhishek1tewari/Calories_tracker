@@ -1,1319 +1,741 @@
 import streamlit as st
+import sqlite3
 import requests
 import pandas as pd
-import os
-import json
+import hashlib
+import hmac
+import secrets
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 
-# ----------------------------------
+# ============================================================
 # PAGE CONFIGURATION
-# ----------------------------------
-
+# ============================================================
 st.set_page_config(
     page_title="My Calorie Tracker",
     page_icon="🥗",
     layout="wide"
 )
 
-FOOD_FILE = "calorie_tracker.csv"
-SETTINGS_FILE = "settings.json"
+DB_FILE = "calorie_tracker.db"
+USDA_API_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
 
-USDA_API_URL = (
-    "https://api.nal.usda.gov/fdc/v1/foods/search"
-)
-
-COLUMNS = [
-    "id",
-    "food_name",
-    "calories",
-    "quantity",
-    "date",
-    "quantity_type",
-    "unit_count",
-    "unit_weight"
-]
+# ============================================================
+# DATABASE
+# Every user has separate food entries and calorie settings.
+# Passwords are stored as salted PBKDF2 hashes, never plaintext.
+# ============================================================
+def get_connection():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-# ----------------------------------
-# CSV STORAGE SETUP
-# ----------------------------------
+def init_db():
+    with get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                password_salt TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER PRIMARY KEY,
+                daily_target REAL NOT NULL DEFAULT 2000,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS food_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                food_name TEXT NOT NULL,
+                calories_per_100g REAL NOT NULL,
+                quantity_g REAL NOT NULL,
+                calories REAL NOT NULL,
+                quantity_type TEXT NOT NULL DEFAULT 'Grams (g)',
+                unit_count REAL NOT NULL DEFAULT 0,
+                unit_weight REAL NOT NULL DEFAULT 0,
+                entry_date TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'Manual',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_food_user_date
+            ON food_entries(user_id, entry_date)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        conn.commit()
 
-def read_food_data():
 
-    if not os.path.exists(FOOD_FILE):
+def hash_password(password, salt=None):
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, 310_000
+    )
+    return digest.hex(), salt.hex()
 
-        return pd.DataFrame(columns=COLUMNS)
+
+def verify_password(password, stored_hash, stored_salt):
+    try:
+        salt = bytes.fromhex(stored_salt)
+        candidate, _ = hash_password(password, salt)
+        return hmac.compare_digest(candidate, stored_hash)
+    except (ValueError, TypeError):
+        return False
+
+
+def create_user(username, password):
+    username = username.strip()
+    if len(username) < 3:
+        return False, "Username must contain at least 3 characters."
+    if len(password) < 8:
+        return False, "Password must contain at least 8 characters."
+    password_hash, salt = hash_password(password)
 
     try:
-
-        df = pd.read_csv(FOOD_FILE)
-
-        for column in COLUMNS:
-
-            if column not in df.columns:
-
-                df[column] = 0
-
-        return df[COLUMNS]
-
-    except (pd.errors.EmptyDataError, pd.errors.ParserError):
-
-        return pd.DataFrame(columns=COLUMNS)
-
-
-def save_food_data(df):
-
-    df.to_csv(
-        FOOD_FILE,
-        index=False
-    )
-
-
-def create_database():
-
-    # Create food CSV file
-
-    if not os.path.exists(FOOD_FILE):
-
-        df = pd.DataFrame(columns=COLUMNS)
-
-        save_food_data(df)
-
-    # Create settings JSON file
-
-    if not os.path.exists(SETTINGS_FILE):
-
-        settings = {
-            "daily_target": 2000
-        }
-
-        with open(SETTINGS_FILE, "w") as f:
-
-            json.dump(
-                settings,
-                f,
-                indent=4
+        with get_connection() as conn:
+            cur = conn.execute(
+                """INSERT INTO users
+                   (username, password_hash, password_salt, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (username, password_hash, salt, datetime.now().isoformat(timespec="seconds"))
             )
-
-    delete_old_data()
-
-
-def delete_old_data():
-
-    df = read_food_data()
-
-    if df.empty:
-        return
-
-    cutoff = (
-        datetime.now() - timedelta(days=10)
-    )
-
-    dates = pd.to_datetime(
-        df["date"],
-        errors="coerce"
-    )
-
-    df = df[
-        (dates >= cutoff) & dates.notna()
-    ]
-
-    save_food_data(df)
+            user_id = cur.lastrowid
+            conn.execute(
+                "INSERT INTO user_settings(user_id, daily_target) VALUES (?, 2000)",
+                (user_id,)
+            )
+            conn.commit()
+        migrate_legacy_csv_once(user_id)
+        return True, "Account created. You are now logged in."
+    except sqlite3.IntegrityError:
+        return False, "That username already exists. Please choose another."
 
 
-# ----------------------------------
-# USDA FOODDATA CENTRAL API
-# ----------------------------------
+def authenticate_user(username, password):
+    with get_connection() as conn:
+        user = conn.execute(
+            "SELECT * FROM users WHERE username = ? COLLATE NOCASE",
+            (username.strip(),)
+        ).fetchone()
 
+    if user and verify_password(password, user["password_hash"], user["password_salt"]):
+        return {"id": user["id"], "username": user["username"]}
+    return None
+
+
+def migrate_legacy_csv_once(first_user_id):
+    """Import the old single-user CSV into the first account only, once."""
+    import os
+
+    legacy_file = "calorie_tracker.csv"
+    with get_connection() as conn:
+        done = conn.execute(
+            "SELECT value FROM app_meta WHERE key='legacy_csv_imported'"
+        ).fetchone()
+        if done:
+            return
+
+        if os.path.exists(legacy_file):
+            try:
+                old = pd.read_csv(legacy_file)
+                for _, row in old.iterrows():
+                    qty = float(row.get("quantity", 0) or 0)
+                    calories = float(row.get("calories", 0) or 0)
+                    if qty <= 0:
+                        continue
+                    per100 = calories * 100 / qty
+                    entry_date = str(row.get("date") or datetime.now().isoformat())
+                    if entry_date in ("nan", "NaT", ""):
+                        entry_date = datetime.now().isoformat()
+                    conn.execute("""
+                        INSERT INTO food_entries
+                        (user_id, food_name, calories_per_100g, quantity_g,
+                         calories, quantity_type, unit_count, unit_weight,
+                         entry_date, source, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Imported CSV', ?)
+                    """, (
+                        first_user_id,
+                        str(row.get("food_name", "Imported food")),
+                        per100, qty, calories,
+                        str(row.get("quantity_type", "Grams (g)")),
+                        float(row.get("unit_count", 0) or 0),
+                        float(row.get("unit_weight", 0) or 0),
+                        entry_date, datetime.now().isoformat(timespec="seconds")
+                    ))
+            except Exception:
+                # Do not block account creation if an old CSV is malformed.
+                pass
+
+        conn.execute(
+            "INSERT OR REPLACE INTO app_meta(key, value) VALUES('legacy_csv_imported', 'yes')"
+        )
+        conn.commit()
+
+
+def get_target(user_id):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT daily_target FROM user_settings WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+    return float(row["daily_target"]) if row else 2000.0
+
+
+def update_target(user_id, target):
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO user_settings(user_id, daily_target)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET daily_target=excluded.daily_target
+        """, (user_id, float(target)))
+        conn.commit()
+
+
+def add_food(user_id, food_name, calories_per_100g, quantity_g,
+             quantity_type="Grams (g)", unit_count=0, unit_weight=0, source="Manual"):
+    quantity_g = float(quantity_g)
+    calories_per_100g = float(calories_per_100g)
+    if not food_name.strip():
+        raise ValueError("Food name is required.")
+    if quantity_g <= 0 or calories_per_100g < 0:
+        raise ValueError("Quantity must be above zero and calories cannot be negative.")
+
+    calories = calories_per_100g * quantity_g / 100
+    now = datetime.now().isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO food_entries
+            (user_id, food_name, calories_per_100g, quantity_g, calories,
+             quantity_type, unit_count, unit_weight, entry_date, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id, food_name.strip(), calories_per_100g, quantity_g,
+            calories, quantity_type, float(unit_count), float(unit_weight),
+            now, source, now
+        ))
+        conn.commit()
+
+
+def get_entries(user_id, selected_day=None):
+    selected_day = selected_day or date.today()
+    start = datetime.combine(selected_day, datetime.min.time()).isoformat()
+    end = (datetime.combine(selected_day, datetime.min.time()) + timedelta(days=1)).isoformat()
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT * FROM food_entries
+            WHERE user_id=? AND entry_date >= ? AND entry_date < ?
+            ORDER BY id DESC
+        """, (user_id, start, end)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_food(user_id, food_id, quantity_g, quantity_type, unit_count, unit_weight):
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT calories_per_100g FROM food_entries
+            WHERE id=? AND user_id=?
+        """, (food_id, user_id)).fetchone()
+        if not row:
+            return False
+        calories = float(row["calories_per_100g"]) * float(quantity_g) / 100
+        conn.execute("""
+            UPDATE food_entries
+            SET quantity_g=?, calories=?, quantity_type=?, unit_count=?, unit_weight=?
+            WHERE id=? AND user_id=?
+        """, (
+            float(quantity_g), calories, quantity_type,
+            float(unit_count), float(unit_weight), food_id, user_id
+        ))
+        conn.commit()
+    return True
+
+
+def delete_food(user_id, food_id):
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM food_entries WHERE id=? AND user_id=?",
+            (food_id, user_id)
+        )
+        conn.commit()
+
+
+def get_history(user_id, days=10):
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT substr(entry_date, 1, 10) AS day, SUM(calories) AS total
+            FROM food_entries
+            WHERE user_id=?
+            GROUP BY substr(entry_date, 1, 10)
+            ORDER BY day DESC LIMIT ?
+        """, (user_id, days)).fetchall()
+    return [(row["day"], float(row["total"] or 0)) for row in rows]
+
+
+# ============================================================
+# USDA FOODDATA CENTRAL
+# ============================================================
 def get_calories_from_nutrients(nutrients):
-
     kcal = None
     kj = None
-
     for nutrient in nutrients:
-
-        nutrient_id = nutrient.get("nutrientId")
-
-        nutrient_info = nutrient.get(
-            "nutrient",
-            {}
+        nutrient_info = nutrient.get("nutrient", {})
+        nutrient_id = (
+            nutrient.get("nutrientId")
+            or nutrient.get("nutrientNumber")
+            or nutrient_info.get("id")
         )
-
-        if nutrient_id is None:
-
-            nutrient_id = nutrient.get(
-                "nutrientNumber"
-            )
-
-        if nutrient_id is None:
-
-            nutrient_id = nutrient_info.get("id")
-
-        nutrient_name = (
+        name = (
             nutrient.get("nutrientName")
             or nutrient_info.get("name")
             or ""
         ).lower()
-
         unit = (
             nutrient.get("unitName")
             or nutrient_info.get("unitName")
             or ""
         ).lower()
-
-        value = (
-            nutrient.get("value")
-            if nutrient.get("value") is not None
-            else nutrient.get("amount")
-        )
-
+        value = nutrient.get("value")
+        if value is None:
+            value = nutrient.get("amount")
         try:
-
             value = float(value)
-
-        except (ValueError, TypeError):
-
+        except (TypeError, ValueError):
             continue
-
         if value < 0:
             continue
-
-        # Energy in kcal
-
-        if unit == "kcal" and (
-            nutrient_id in (1008, 2047, 2048)
-            or "energy" in nutrient_name
-        ):
-
+        if unit == "kcal" and (nutrient_id in (1008, 2047, 2048) or "energy" in name):
             if nutrient_id == 1008:
-
-                kcal = value
-                break
-
+                return value
             if kcal is None:
-
                 kcal = value
-
-        # Energy in kJ
-
-        elif unit == "kj" and (
-            nutrient_id == 1062
-            or "energy" in nutrient_name
-        ):
-
+        elif unit == "kj" and (nutrient_id == 1062 or "energy" in name):
             kj = value
-
     if kcal is not None:
-
         return kcal
-
     if kj is not None:
-
         return kj / 4.184
-
     return None
 
 
-@st.cache_data(
-    ttl=60,
-    show_spinner=False
-)
+@st.cache_data(ttl=60, show_spinner=False)
 def search_food_api(food_name, api_key):
-
-    params = {
-
-        "query": food_name,
-
-        "pageSize": 20,
-
-        "pageNumber": 1,
-
-        "api_key": api_key
-
-    }
-
+    params = {"query": food_name, "pageSize": 20, "pageNumber": 1, "api_key": api_key}
     for attempt in range(3):
-
         try:
-
-            response = requests.get(
-
-                USDA_API_URL,
-
-                params=params,
-
-                timeout=20
-
-            )
-
+            response = requests.get(USDA_API_URL, params=params, timeout=20)
             if response.status_code == 429:
-
                 if attempt < 2:
-
                     time.sleep(2 ** attempt)
-
                     continue
-
-                return [], (
-                    "USDA API rate limit exceeded. "
-                    "Please try again later."
-                )
-
+                return [], "USDA rate limit exceeded. Try again shortly."
             response.raise_for_status()
-
             data = response.json()
-
             results = []
-
             for product in data.get("foods", []):
-
-                nutrients = product.get(
-                    "foodNutrients",
-                    []
-                )
-
-                calories = get_calories_from_nutrients(
-                    nutrients
-                )
-
-                if calories is None:
+                calories = get_calories_from_nutrients(product.get("foodNutrients", []))
+                if calories is None or calories < 0:
                     continue
-
-                if calories < 0:
-                    continue
-
-                name = (
-                    product.get("description")
-                    or ""
-                ).strip()
-
+                name = (product.get("description") or "").strip()
                 if not name:
                     continue
 
-                # ----------------------------------
-                # SERVING INFORMATION
-                # ----------------------------------
-
                 serving_weight = None
-
                 serving_size = ""
-
-                api_serving_size = product.get(
-                    "servingSize"
-                )
-
-                serving_unit = product.get(
-                    "servingSizeUnit",
-                    ""
-                )
-
-                if api_serving_size is not None:
-
+                serving = product.get("servingSize")
+                serving_unit = product.get("servingSizeUnit", "")
+                if serving is not None:
                     try:
-
-                        api_serving_size = float(
-                            api_serving_size
-                        )
-
-                        serving_size = (
-                            f"{api_serving_size:g} "
-                            f"{serving_unit}"
-                        )
-
-                        if (
-                            serving_unit.lower() == "g"
-                            and api_serving_size > 0
-                        ):
-
-                            serving_weight = api_serving_size
-
-                    except (ValueError, TypeError):
-
+                        serving = float(serving)
+                        serving_size = f"{serving:g} {serving_unit}"
+                        if serving_unit.lower() == "g" and serving > 0:
+                            serving_weight = serving
+                    except (TypeError, ValueError):
                         pass
 
-                # Get weight from food portions
-
-                portions = product.get(
-                    "foodPortions",
-                    []
-                )
-
-                if serving_weight is None and portions:
-
-                    first_portion = portions[0]
-
-                    gram_weight = first_portion.get(
-                        "gramWeight"
-                    )
-
-                    try:
-
-                        gram_weight = float(
-                            gram_weight
-                        )
-
-                        if gram_weight > 0:
-
-                            serving_weight = gram_weight
-
-                    except (ValueError, TypeError):
-
-                        pass
-
-                    if not serving_size:
-
-                        serving_size = (
-                            first_portion.get("modifier")
-                            or ""
-                        )
-
-                brand = (
-                    product.get("brandOwner")
-                    or product.get("brandName")
-                    or ""
-                )
+                if serving_weight is None:
+                    portions = product.get("foodPortions", [])
+                    if portions:
+                        try:
+                            weight = float(portions[0].get("gramWeight"))
+                            if weight > 0:
+                                serving_weight = weight
+                                serving_size = portions[0].get("modifier") or ""
+                        except (TypeError, ValueError):
+                            pass
 
                 results.append({
-
                     "name": name,
-
-                    "calories": calories,
-
-                    "brand": brand,
-
+                    "calories": float(calories),
+                    "brand": product.get("brandOwner") or product.get("brandName") or "",
                     "serving_weight": serving_weight,
-
-                    "serving_size": serving_size,
-
-                    "barcode": str(
-                        product.get("gtinUpc")
-                        or product.get("fdcId", "")
-                    )
-
+                    "serving_size": serving_size
                 })
-
             return results, None
-
-        except requests.exceptions.HTTPError as e:
-
-            status = (
-                e.response.status_code
-                if e.response is not None
-                else None
-            )
-
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
             if status in (401, 403):
-
-                return [], (
-                    "Invalid USDA API key. "
-                    "Please check your API key."
-                )
-
-            return [], f"USDA API error: {e}"
-
-        except requests.exceptions.RequestException as e:
-
+                return [], "Invalid USDA API key. Check your key."
+            return [], f"USDA API error: {exc}"
+        except requests.exceptions.RequestException as exc:
             if attempt < 2:
-
                 time.sleep(2 ** attempt)
-
             else:
-
-                return [], f"Connection error: {e}"
-
+                return [], f"Connection error: {exc}"
         except ValueError:
-
-            return [], (
-                "Invalid response received from USDA API."
-            )
-
+            return [], "USDA returned an invalid response."
     return [], "Unable to retrieve food information."
 
 
-# ----------------------------------
-# ADD FOOD
-# ----------------------------------
-
-def add_food(
-    food,
-    quantity,
-    quantity_type,
-    unit_count=0,
-    unit_weight=0
-):
-
-    if quantity_type == "Grams (g)":
-
-        total_weight = quantity
-
-    else:
-
-        total_weight = unit_count * unit_weight
-
-    calories = (
-        food["calories"] * total_weight / 100
-    )
-
-    df = read_food_data()
-
-    existing_ids = pd.to_numeric(
-        df["id"],
-        errors="coerce"
-    ).dropna()
-
-    if existing_ids.empty:
-
-        next_id = 1
-
-    else:
-
-        next_id = int(
-            existing_ids.max()
-        ) + 1
-
-    new_entry = pd.DataFrame([{
-
-        "id": next_id,
-
-        "food_name": food["name"],
-
-        "calories": calories,
-
-        "quantity": total_weight,
-
-        "date": datetime.now().isoformat(
-            timespec="seconds"
-        ),
-
-        "quantity_type": quantity_type,
-
-        "unit_count": unit_count,
-
-        "unit_weight": unit_weight
-
-    }])
-
-    df = pd.concat(
-        [df, new_entry],
-        ignore_index=True
-    )
-
-    save_food_data(df)
-
-
-# ----------------------------------
-# GET FOOD DIARY
-# ----------------------------------
-
-def get_daily_food():
-
-    df = read_food_data()
-
-    if df.empty:
-        return []
-
-    today = datetime.now().date()
-
-    dates = pd.to_datetime(
-        df["date"],
-        errors="coerce"
-    )
-
-    df = df[
-        dates.dt.date == today
-    ]
-
-    df = df.sort_values(
-        "id",
-        ascending=False
-    )
-
-    return df[COLUMNS].values.tolist()
-
-
-def get_daily_total():
-
-    entries = get_daily_food()
-
-    return sum(
-        float(row[2])
-        for row in entries
-    )
-
-
-def delete_food(food_id):
-
-    df = read_food_data()
-
-    ids = pd.to_numeric(
-        df["id"],
-        errors="coerce"
-    )
-
-    df = df[
-        ids != food_id
-    ]
-
-    save_food_data(df)
-
-
-# ----------------------------------
-# SETTINGS
-# ----------------------------------
-
-def get_target():
-
-    try:
-
-        with open(SETTINGS_FILE, "r") as f:
-
-            settings = json.load(f)
-
-        return settings.get(
-            "daily_target",
-            2000
-        )
-
-    except (FileNotFoundError, json.JSONDecodeError):
-
-        return 2000
-
-
-def update_target(target):
-
-    settings = {
-
-        "daily_target": target
-
-    }
-
-    with open(SETTINGS_FILE, "w") as f:
-
-        json.dump(
-            settings,
-            f,
-            indent=4
-        )
-
-
-# ----------------------------------
-# HISTORY
-# ----------------------------------
-
-def get_history():
-
-    df = read_food_data()
-
-    if df.empty:
-        return []
-
-    df["date"] = pd.to_datetime(
-        df["date"],
-        errors="coerce"
-    )
-
-    df = df.dropna(
-        subset=["date"]
-    )
-
-    df["day"] = df["date"].dt.date
-
-    history = (
-        df.groupby("day")["calories"]
-        .sum()
-        .sort_index(ascending=False)
-        .head(10)
-    )
-
-    return [
-        (str(day), calories)
-        for day, calories in history.items()
-    ]
-
-
-# ----------------------------------
-# INITIALIZE APPLICATION
-# ----------------------------------
-
-create_database()
-
-
-# ----------------------------------
-# SIDEBAR - USDA API KEY
-# ----------------------------------
-
-st.sidebar.title("⚙️ Settings")
-
-st.sidebar.subheader(
-    "USDA API Configuration"
-)
-
-st.sidebar.caption(
-    "Enter your free USDA FoodData Central API key."
-)
-
-api_key = st.sidebar.text_input(
-
-    "USDA API Key",
-
-    type="password",
-
-    placeholder="Enter your API key",
-
-    help="Your API key is kept in the current session."
-
-)
-
-if api_key:
-
-    st.sidebar.success(
-        "API key entered."
-    )
-
-else:
-
-    st.sidebar.warning(
-        "Enter your USDA API key to search foods."
-    )
-
-st.sidebar.markdown("---")
-
-st.sidebar.caption(
-    "Get your free API key:"
-)
-
-st.sidebar.markdown(
-    "[USDA API Registration](https://api.data.gov/signup/)"
-)
-
-st.sidebar.markdown(
-    "[USDA API Documentation](https://fdc.nal.usda.gov/api-guide/)"
-)
-
-
-# ----------------------------------
-# APPLICATION HEADER
-# ----------------------------------
-
-st.title("🥗 My Calorie Tracker")
-
-st.caption(
-    "Track your food intake and monitor your daily calories."
-)
-
-st.divider()
-
-
-# ----------------------------------
-# DAILY CALORIE TARGET
-# ----------------------------------
-
-st.subheader("🎯 Daily Calorie Target")
-
-target = get_target()
-
-new_target = st.number_input(
-
-    "Set your daily calorie limit (kcal)",
-
-    min_value=100,
-
-    max_value=10000,
-
-    value=int(target),
-
-    step=50
-
-)
-
-if new_target != target:
-
-    update_target(new_target)
-
-    st.success(
-        "Daily calorie target updated!"
-    )
-
-
-# ----------------------------------
-# DASHBOARD
-# ----------------------------------
-
-total = get_daily_total()
-
-remaining = new_target - total
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-
-    st.metric(
-        "Calories Consumed",
-        f"{total:.0f} kcal"
-    )
-
-with col2:
-
-    st.metric(
-        "Daily Target",
-        f"{new_target:.0f} kcal"
-    )
-
-with col3:
-
-    st.metric(
-        "Calories Remaining",
-        f"{remaining:.0f} kcal"
-    )
-
-st.progress(
-    max(0.0, min(total / new_target, 1.0))
-)
-
-if remaining >= 0:
-
-    st.success(
-        f"You have {remaining:.0f} kcal remaining today."
-    )
-
-else:
-
-    st.warning(
-        f"You exceeded your target by "
-        f"{abs(remaining):.0f} kcal."
-    )
-
-st.divider()
-
-
-# ----------------------------------
-# SELECT FOOD ENTRY METHOD
-# ----------------------------------
-
-st.subheader("🔍 Add Food")
-
-entry_method = st.radio(
-
-    "Choose how you want to add food",
-
-    [
-        "Search USDA Food Database",
-        "Enter Food Manually"
-    ],
-
-    horizontal=True
-
-)
-
-selected_food = None
-
-
-# ----------------------------------
-# USDA FOOD SEARCH
-# ----------------------------------
-
-if entry_method == "Search USDA Food Database":
-
-    food_query = st.text_input(
-
-        "Enter food name",
-
-        placeholder="Example: Apple, Egg, Banana, Rice..."
-
-    )
-
-    if len(food_query.strip()) >= 2:
-
-        if not api_key:
-
-            st.warning(
-                "Please enter your USDA API key "
-                "in the sidebar before searching."
-            )
-
-        else:
-
-            with st.spinner(
-                "Searching USDA FoodData Central..."
-            ):
-
-                foods, api_error = search_food_api(
-                    food_query.strip(),
-                    api_key
-                )
-
-            if api_error:
-
-                st.error(api_error)
-
-            elif foods:
-
-                options = []
-
-                for food in foods:
-
-                    brand = food["brand"]
-
-                    label = food["name"]
-
-                    if brand:
-
-                        label += f" | {brand}"
-
-                    label += (
-                        f" | {food['calories']:.1f} "
-                        f"kcal / 100 g"
-                    )
-
-                    options.append(label)
-
-                selected_index = st.selectbox(
-
-                    "Select a food product",
-
-                    range(len(foods)),
-
-                    format_func=lambda i: options[i]
-
-                )
-
-                selected_food = foods[selected_index]
-
-                st.info(
-                    f"""
-                    **Food:** {selected_food['name']}
-
-                    **Brand:** {selected_food['brand'] or 'Not available'}
-
-                    **Calories:** {selected_food['calories']:.1f} kcal / 100 g
-
-                    **Serving information:** {
-                        selected_food['serving_size']
-                        or 'Not provided'
-                    }
-
-                    **Serving weight:** {
-                        f"{selected_food['serving_weight']:.1f} g"
-                        if selected_food['serving_weight']
-                        else "Not provided"
-                    }
-                    """
-                )
-
+# ============================================================
+# INITIALIZE
+# ============================================================
+init_db()
+
+if "user" not in st.session_state:
+    st.session_state.user = None
+if "selected_food" not in st.session_state:
+    st.session_state.selected_food = None
+
+# ============================================================
+# LOGIN / REGISTRATION
+# ============================================================
+if st.session_state.user is None:
+    st.title("🥗 My Calorie Tracker")
+    st.caption("Create your own account. Each account has a private food diary and calorie target.")
+
+    login_tab, register_tab = st.tabs(["Login", "Create account"])
+
+    with login_tab:
+        with st.form("login_form"):
+            login_username = st.text_input("Username")
+            login_password = st.text_input("Password", type="password")
+            login_submit = st.form_submit_button("Login", use_container_width=True)
+        if login_submit:
+            user = authenticate_user(login_username, login_password)
+            if user:
+                st.session_state.user = user
+                st.session_state.selected_food = None
+                st.rerun()
             else:
-
-                st.warning(
-                    "No matching foods with calorie "
-                    "information were found."
-                )
-
-    elif food_query:
-
-        st.caption(
-            "Enter at least 2 characters to search."
-        )
-
-
-# ----------------------------------
-# MANUAL FOOD ENTRY
-# ----------------------------------
-
-else:
-
-    st.write(
-        "Enter food information manually when "
-        "the food is not available in USDA."
-    )
-
-    with st.form("manual_food_form"):
-
-        manual_name = st.text_input(
-
-            "Food name",
-
-            placeholder="Example: Homemade Paneer Curry"
-
-        )
-
-        manual_calories = st.number_input(
-
-            "Calories per 100 grams (kcal)",
-
-            min_value=0.0,
-
-            max_value=10000.0,
-
-            value=100.0,
-
-            step=1.0
-
-        )
-
-        manual_submitted = st.form_submit_button(
-
-            "Use Manual Food",
-
-            use_container_width=True
-
-        )
-
-    if manual_submitted:
-
-        if not manual_name.strip():
-
-            st.error(
-                "Please enter a food name."
-            )
-
-        else:
-
-            selected_food = {
-
-                "name": manual_name.strip(),
-
-                "calories": manual_calories,
-
-                "brand": "Manual Entry",
-
-                "serving_weight": None,
-
-                "serving_size": "Manually entered",
-
-                "barcode": ""
-
-            }
-
-            st.success(
-                f"{manual_name} selected successfully!"
-            )
-
-
-# ----------------------------------
-# COMMON QUANTITY AND CALCULATION
-# ----------------------------------
-
-if selected_food is not None:
-
-    st.divider()
-
-    st.subheader(
-        "Select Quantity Type"
-    )
-
-    quantity_type = st.radio(
-
-        "Choose how you want to measure food",
-
-        ["Grams (g)", "Units (pieces)"],
-
-        horizontal=True
-
-    )
-
-    unit_count = 0
-
-    unit_weight = 0
-
-    quantity = 100
-
-    # ----------------------------------
-    # GRAMS
-    # ----------------------------------
-
-    if quantity_type == "Grams (g)":
-
-        quantity = st.number_input(
-
-            "Enter quantity in grams",
-
-            min_value=1,
-
-            max_value=5000,
-
-            value=100,
-
-            step=10
-
-        )
-
-        total_weight = quantity
-
-    # ----------------------------------
-    # UNITS
-    # ----------------------------------
-
-    else:
-
-        unit_count = st.number_input(
-
-            "Enter number of pieces",
-
-            min_value=1,
-
-            max_value=100,
-
-            value=1,
-
-            step=1
-
-        )
-
-        api_weight = selected_food["serving_weight"]
-
-        if api_weight is not None:
-
-            unit_weight = st.number_input(
-
-                "Weight of one piece (grams)",
-
-                min_value=1,
-
-                max_value=5000,
-
-                value=max(
-                    1,
-                    int(round(api_weight))
-                ),
-
-                step=1,
-
-                help=(
-                    "Prefilled using the USDA serving weight. "
-                    "Verify that the serving corresponds "
-                    "to one piece."
-                )
-
-            )
-
-        else:
-
-            st.warning(
-                "Serving weight is not available. "
-                "Please enter the weight manually."
-            )
-
-            unit_weight = st.number_input(
-
-                "Weight of one piece (grams)",
-
-                min_value=1,
-
-                max_value=5000,
-
-                value=100,
-
-                step=1
-
-            )
-
-        total_weight = unit_count * unit_weight
-
-    # ----------------------------------
-    # CALCULATE CALORIES
-    # ----------------------------------
-
-    calculated_calories = (
-
-        selected_food["calories"]
-        * total_weight / 100
-
-    )
-
-    st.divider()
-
-    st.subheader(
-        "Calorie Calculation"
-    )
-
-    st.metric(
-
-        "Total Calories",
-
-        f"{calculated_calories:.1f} kcal"
-
-    )
-
-    st.write(
-        f"**Food:** {selected_food['name']}"
-    )
-
-    st.write(
-        f"**Calories per 100 g:** "
-        f"{selected_food['calories']:.1f} kcal"
-    )
-
-    st.write(
-        f"**Total Weight:** {total_weight:.1f} g"
-    )
-
-    if quantity_type == "Units (pieces)":
-
-        st.write(
-            f"**Quantity:** {unit_count:.0f} piece(s)"
-        )
-
-    else:
-
-        st.write(
-            f"**Quantity:** {quantity:.0f} g"
-        )
-
-    # ----------------------------------
-    # ADD FOOD
-    # ----------------------------------
-
-    if st.button(
-
-        "➕ Add Food",
-
-        use_container_width=True
-
-    ):
-
-        add_food(
-
-            selected_food,
-
-            quantity,
-
-            quantity_type,
-
-            unit_count,
-
-            unit_weight
-
-        )
-
-        st.success(
-            "Food added successfully!"
-        )
-
+                st.error("Incorrect username or password.")
+
+    with register_tab:
+        with st.form("register_form"):
+            new_username = st.text_input("Choose a username")
+            new_password = st.text_input("Choose a password", type="password")
+            confirm_password = st.text_input("Confirm password", type="password")
+            register_submit = st.form_submit_button("Create account", use_container_width=True)
+        if register_submit:
+            if new_password != confirm_password:
+                st.error("Passwords do not match.")
+            else:
+                ok, message = create_user(new_username, new_password)
+                if ok:
+                    user = authenticate_user(new_username, new_password)
+                    st.session_state.user = user
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.error(message)
+
+    st.stop()
+
+
+# ============================================================
+# MAIN APPLICATION
+# ============================================================
+user = st.session_state.user
+user_id = user["id"]
+
+with st.sidebar:
+    st.title("⚙️ Account")
+    st.write(f"Logged in as **{user['username']}**")
+    if st.button("Log out", use_container_width=True):
+        st.session_state.user = None
+        st.session_state.selected_food = None
         st.rerun()
 
+    st.divider()
+    st.subheader("USDA API Configuration")
+    api_key = st.text_input(
+        "USDA API Key",
+        type="password",
+        placeholder="Enter your API key",
+        help="Used only for food searches in this session."
+    )
+    st.caption("Get a free key at https://api.data.gov/signup/")
+
+st.title("🥗 My Calorie Tracker")
+st.caption(f"Your personal food diary — account: {user['username']}")
+st.divider()
+
+# Daily target is stored separately for each user.
+st.subheader("🎯 Daily Calorie Target")
+target = get_target(user_id)
+new_target = st.number_input(
+    "Set your daily calorie limit (kcal)",
+    min_value=100, max_value=10000, value=int(target), step=50,
+    key=f"target_{user_id}"
+)
+if float(new_target) != float(target):
+    update_target(user_id, new_target)
+    st.success("Your calorie target has been updated.")
+
+today_entries = get_entries(user_id)
+total = sum(item["calories"] for item in today_entries)
+remaining = float(new_target) - total
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Calories consumed", f"{total:.0f} kcal")
+c2.metric("Daily target", f"{new_target:.0f} kcal")
+c3.metric("Calories remaining", f"{remaining:.0f} kcal")
+st.progress(max(0.0, min(total / max(float(new_target), 1), 1.0)))
+if remaining >= 0:
+    st.success(f"You have {remaining:.0f} kcal remaining today.")
+else:
+    st.warning(f"You exceeded your target by {abs(remaining):.0f} kcal.")
 
 st.divider()
 
-
-# ----------------------------------
-# TODAY'S FOOD DIARY
-# ----------------------------------
-
-st.subheader(
-    "📋 Today's Food Diary"
+# ============================================================
+# ADD FOOD — selected food is held in session_state so it
+# survives Streamlit reruns (this fixes the old manual-entry bug).
+# ============================================================
+st.subheader("➕ Add Food")
+entry_method = st.radio(
+    "Choose how to add food",
+    ["Search USDA Food Database", "Enter Food Manually"],
+    horizontal=True,
+    key="entry_method"
 )
 
-entries = get_daily_food()
+if entry_method == "Search USDA Food Database":
+    food_query = st.text_input(
+        "Search food",
+        placeholder="Example: apple, egg, banana, cooked rice",
+        key="usda_query"
+    )
+    if len(food_query.strip()) >= 2:
+        if not api_key:
+            st.info("Enter your USDA API key in the sidebar to search.")
+        else:
+            with st.spinner("Searching USDA FoodData Central..."):
+                foods, api_error = search_food_api(food_query.strip(), api_key)
+            if api_error:
+                st.error(api_error)
+            elif foods:
+                labels = [
+                    f"{f['name']} | {f['brand'] or 'Generic'} | {f['calories']:.1f} kcal / 100 g"
+                    for f in foods
+                ]
+                selected_index = st.selectbox(
+                    "Select a food",
+                    range(len(foods)),
+                    format_func=lambda i: labels[i],
+                    key="usda_selected_index"
+                )
+                if st.button("Use selected USDA food", key="use_usda_food"):
+                    st.session_state.selected_food = {
+                        **foods[selected_index],
+                        "source": "USDA"
+                    }
+                    st.rerun()
+            else:
+                st.warning("No matching foods with calorie information were found.")
+
+else:
+    st.write("Add homemade food or any item not found in the USDA database.")
+    with st.form("manual_food_form", clear_on_submit=False):
+        manual_name = st.text_input(
+            "Food name",
+            placeholder="Example: Homemade paneer curry",
+            key="manual_food_name"
+        )
+        manual_calories = st.number_input(
+            "Calories per 100 grams (kcal)",
+            min_value=0.0, max_value=10000.0, value=150.0, step=1.0,
+            key="manual_food_calories"
+        )
+        manual_submit = st.form_submit_button("Continue to quantity")
+    if manual_submit:
+        if not manual_name.strip():
+            st.error("Please enter a food name.")
+        else:
+            st.session_state.selected_food = {
+                "name": manual_name.strip(),
+                "calories": float(manual_calories),
+                "brand": "Manual entry",
+                "serving_weight": None,
+                "serving_size": "User entered",
+                "source": "Manual"
+            }
+            st.rerun()
+
+# Common quantity section, available after either method selects a food.
+selected_food = st.session_state.selected_food
+if selected_food is not None:
+    st.divider()
+    st.markdown(f"**Selected food:** {selected_food['name']}")
+    st.caption(f"{selected_food['calories']:.1f} kcal per 100 g · {selected_food.get('source', 'Manual')}")
+
+    quantity_type = st.radio(
+        "Quantity unit",
+        ["Grams (g)", "Units (pieces)"],
+        horizontal=True,
+        key="add_quantity_type"
+    )
+
+    if quantity_type == "Grams (g)":
+        quantity_g = st.number_input(
+            "Quantity in grams", min_value=1.0, max_value=10000.0,
+            value=100.0, step=10.0, key="add_quantity_grams"
+        )
+        unit_count = 0.0
+        unit_weight = 0.0
+    else:
+        unit_count = st.number_input(
+            "Number of pieces", min_value=1.0, max_value=1000.0,
+            value=1.0, step=1.0, key="add_unit_count"
+        )
+        default_weight = selected_food.get("serving_weight") or 100
+        unit_weight = st.number_input(
+            "Weight of one piece (grams)", min_value=1.0,
+            max_value=5000.0, value=float(default_weight),
+            step=1.0, key="add_unit_weight"
+        )
+        quantity_g = unit_count * unit_weight
+
+    calculated = selected_food["calories"] * quantity_g / 100
+    a, b = st.columns(2)
+    a.metric("Total quantity", f"{quantity_g:.1f} g")
+    b.metric("Calories for this quantity", f"{calculated:.1f} kcal")
+
+    add_col, clear_col = st.columns(2)
+    with add_col:
+        if st.button("➕ Add food to my diary", type="primary", use_container_width=True):
+            try:
+                add_food(
+                    user_id=user_id,
+                    food_name=selected_food["name"],
+                    calories_per_100g=selected_food["calories"],
+                    quantity_g=quantity_g,
+                    quantity_type=quantity_type,
+                    unit_count=unit_count,
+                    unit_weight=unit_weight,
+                    source=selected_food.get("source", "Manual")
+                )
+                st.session_state.selected_food = None
+                st.success("Food added to your diary.")
+                st.rerun()
+            except (ValueError, sqlite3.Error) as exc:
+                st.error(f"Could not add food: {exc}")
+    with clear_col:
+        if st.button("Clear selected food", use_container_width=True):
+            st.session_state.selected_food = None
+            st.rerun()
+
+st.divider()
+
+# ============================================================
+# FOOD DIARY — edit and delete controls are user-scoped.
+# ============================================================
+st.subheader("📋 Food Diary")
+diary_day = st.date_input("View diary for", value=date.today(), key="diary_day")
+entries = get_entries(user_id, diary_day)
 
 if entries:
+    st.metric(f"Total calories on {diary_day.strftime('%d %b %Y')}",
+              f"{sum(e['calories'] for e in entries):.1f} kcal")
 
     for entry in entries:
-
-        food_id = int(entry[0])
-
-        food_name = entry[1]
-
-        calories = float(entry[2])
-
-        quantity = float(entry[3])
-
-        quantity_type = entry[5]
-
-        unit_count = float(entry[6])
-
-        col1, col2, col3 = st.columns(
-            [3, 2, 1]
-        )
-
-        with col1:
-
-            st.write(
-                f"**{food_name}**"
+        title = f"{entry['food_name']} — {entry['quantity_g']:.0f} g — {entry['calories']:.1f} kcal"
+        with st.expander(title):
+            st.caption(
+                f"Source: {entry['source']} · Added: "
+                f"{entry['created_at'][:16].replace('T', ' ')}"
             )
-
-        with col2:
-
-            if quantity_type == "Units (pieces)":
-
-                st.write(
-                    f"{unit_count:.0f} piece(s) | "
-                    f"{calories:.1f} kcal"
+            with st.form(f"edit_form_{entry['id']}"):
+                edit_quantity = st.number_input(
+                    "Edit quantity (grams)",
+                    min_value=0.1, max_value=10000.0,
+                    value=float(entry["quantity_g"]), step=1.0,
+                    key=f"edit_qty_{entry['id']}"
                 )
-
-            else:
-
-                st.write(
-                    f"{quantity:.0f} g | "
-                    f"{calories:.1f} kcal"
+                edit_type = st.selectbox(
+                    "Quantity type",
+                    ["Grams (g)", "Units (pieces)"],
+                    index=0 if entry["quantity_type"] == "Grams (g)" else 1,
+                    key=f"edit_type_{entry['id']}"
                 )
+                edit_count = st.number_input(
+                    "Number of pieces (if applicable)",
+                    min_value=0.0, max_value=1000.0,
+                    value=float(entry["unit_count"]), step=1.0,
+                    key=f"edit_count_{entry['id']}"
+                )
+                edit_weight = st.number_input(
+                    "Weight per piece in grams (if applicable)",
+                    min_value=0.0, max_value=5000.0,
+                    value=float(entry["unit_weight"]), step=1.0,
+                    key=f"edit_weight_{entry['id']}"
+                )
+                save_edit = st.form_submit_button("Save quantity changes")
+            if save_edit:
+                if edit_type == "Units (pieces)":
+                    if edit_count <= 0 or edit_weight <= 0:
+                        st.error("Enter a positive piece count and piece weight.")
+                    else:
+                        final_qty = edit_count * edit_weight
+                        update_food(
+                            user_id, entry["id"], final_qty,
+                            edit_type, edit_count, edit_weight
+                        )
+                        st.success("Food quantity updated.")
+                        st.rerun()
+                else:
+                    update_food(
+                        user_id, entry["id"], edit_quantity,
+                        edit_type, 0, 0
+                    )
+                    st.success("Food quantity updated.")
+                    st.rerun()
 
-        with col3:
-
-            if st.button(
-
-                "Delete",
-
-                key=f"delete_{food_id}"
-
-            ):
-
-                delete_food(food_id)
-
+            if st.button("🗑️ Delete this entry", key=f"delete_{entry['id']}"):
+                delete_food(user_id, entry["id"])
+                st.success("Entry deleted.")
                 st.rerun()
-
 else:
-
-    st.info(
-        "No food added today."
-    )
-
+    st.info("No food entries for this date.")
 
 st.divider()
 
-
-# ----------------------------------
-# LAST 10 DAYS HISTORY
-# ----------------------------------
-
-st.subheader(
-    "📅 Last 10 Days History"
-)
-
-history = get_history()
-
+# ============================================================
+# HISTORY
+# ============================================================
+st.subheader("📅 Last 10 Days History")
+history = get_history(user_id)
 if history:
-
-    for day, calories in history:
-
-        st.write(
-            f"**{day}** — {calories:.1f} kcal"
-        )
-
+    hist_df = pd.DataFrame(history, columns=["Date", "Calories (kcal)"])
+    st.dataframe(hist_df, use_container_width=True, hide_index=True)
 else:
-
-    st.info(
-        "Your food history will appear here."
-    )
-
+    st.info("Your food history will appear here.")
 
 st.divider()
-
-
-# ----------------------------------
-# FOOTER
-# ----------------------------------
-
 st.caption(
-    "Food and nutrition information provided by "
-    "USDA FoodData Central."
-)
-
-st.caption(
-    "Manually entered food calories are provided "
-    "by the user."
-)
-
-st.caption(
-    "Food diary entries are stored in local CSV files. "
-    "USDA serving information may be incomplete."
+    "Food entries and calorie targets are stored separately for each account "
+    "in a local SQLite database. USDA values are estimates; manually entered "
+    "calories are supplied by the user."
 )
