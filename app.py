@@ -72,6 +72,9 @@ def init_db():
                     calories_per_100g DOUBLE PRECISION NOT NULL,
                     quantity_g DOUBLE PRECISION NOT NULL,
                     calories DOUBLE PRECISION NOT NULL,
+                    protein_per_100g DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    carbs_per_100g DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    fat_per_100g DOUBLE PRECISION NOT NULL DEFAULT 0,
                     quantity_type TEXT NOT NULL DEFAULT 'Grams (g)',
                     unit_count DOUBLE PRECISION NOT NULL DEFAULT 0,
                     unit_weight DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -80,6 +83,10 @@ def init_db():
                     created_at TEXT NOT NULL
                 )
             """)
+            # Safe migration for existing databases
+            cur.execute("ALTER TABLE food_entries ADD COLUMN IF NOT EXISTS protein_per_100g DOUBLE PRECISION NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE food_entries ADD COLUMN IF NOT EXISTS carbs_per_100g DOUBLE PRECISION NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE food_entries ADD COLUMN IF NOT EXISTS fat_per_100g DOUBLE PRECISION NOT NULL DEFAULT 0")
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_food_user_date
                 ON food_entries(user_id, entry_date)
@@ -160,6 +167,7 @@ def update_target(user_id, target):
 
 
 def add_food(user_id, food_name, calories_per_100g, quantity_g,
+             protein_per_100g=0, carbs_per_100g=0, fat_per_100g=0,
              quantity_type="Grams (g)", unit_count=0, unit_weight=0, source="Manual"):
     quantity_g = float(quantity_g)
     calories_per_100g = float(calories_per_100g)
@@ -174,11 +182,12 @@ def add_food(user_id, food_name, calories_per_100g, quantity_g,
             cur.execute("""
                 INSERT INTO food_entries
                 (user_id, food_name, calories_per_100g, quantity_g, calories,
+                 protein_per_100g, carbs_per_100g, fat_per_100g,
                  quantity_type, unit_count, unit_weight, entry_date, source, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (user_id, food_name.strip(), calories_per_100g, quantity_g,
-                  calories, quantity_type, float(unit_count), float(unit_weight),
-                  now, source, now))
+                  calories, float(protein_per_100g), float(carbs_per_100g), float(fat_per_100g),
+                  quantity_type, float(unit_count), float(unit_weight), now, source, now))
 
 
 def get_entries(user_id, selected_day=None):
@@ -276,6 +285,20 @@ def get_calories_from_nutrients(nutrients):
     return None
 
 
+def get_macro_from_nutrients(nutrients, nutrient_id):
+    """Return grams per 100 g from USDA nutrient data; missing values default to 0."""
+    for nutrient in nutrients:
+        info = nutrient.get("nutrient", {})
+        current_id = nutrient.get("nutrientId") or info.get("id")
+        if current_id is not None and int(current_id) == nutrient_id:
+            try:
+                value = nutrient.get("value", nutrient.get("amount", 0))
+                return max(0.0, float(value or 0))
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def search_food_api(food_name, api_key):
     params = {"query": food_name, "pageSize": 20, "pageNumber": 1, "api_key": api_key}
@@ -325,6 +348,9 @@ def search_food_api(food_name, api_key):
                 results.append({
                     "name": name,
                     "calories": float(calories),
+                    "protein": get_macro_from_nutrients(product.get("foodNutrients", []), 1003),
+                    "carbs": get_macro_from_nutrients(product.get("foodNutrients", []), 1005),
+                    "fat": get_macro_from_nutrients(product.get("foodNutrients", []), 1004),
                     "brand": product.get("brandOwner") or product.get("brandName") or "",
                     "serving_weight": serving_weight,
                     "serving_size": serving_size
@@ -530,6 +556,9 @@ else:
             min_value=0.0, max_value=10000.0, value=150.0, step=1.0,
             key="manual_food_calories"
         )
+        manual_protein = st.number_input("Protein per 100 g", min_value=0.0, max_value=1000.0, value=0.0, step=0.5)
+        manual_carbs = st.number_input("Carbohydrates per 100 g", min_value=0.0, max_value=1000.0, value=0.0, step=0.5)
+        manual_fat = st.number_input("Fat per 100 g", min_value=0.0, max_value=1000.0, value=0.0, step=0.5)
         manual_submit = st.form_submit_button("Continue to quantity")
     if manual_submit:
         if not manual_name.strip():
@@ -538,6 +567,9 @@ else:
             st.session_state.selected_food = {
                 "name": manual_name.strip(),
                 "calories": float(manual_calories),
+                "protein": float(manual_protein),
+                "carbs": float(manual_carbs),
+                "fat": float(manual_fat),
                 "brand": "Manual entry",
                 "serving_weight": None,
                 "serving_size": "User entered",
@@ -550,7 +582,13 @@ selected_food = st.session_state.selected_food
 if selected_food is not None:
     st.divider()
     st.markdown(f"**Selected food:** {selected_food['name']}")
-    st.caption(f"{selected_food['calories']:.1f} kcal per 100 g · {selected_food.get('source', 'Manual')}")
+    st.caption(
+        f"{selected_food['calories']:.1f} kcal · "
+        f"P {selected_food.get('protein', 0):.1f} g · "
+        f"C {selected_food.get('carbs', 0):.1f} g · "
+        f"F {selected_food.get('fat', 0):.1f} g per 100 g · "
+        f"{selected_food.get('source', 'Manual')}"
+    )
 
     quantity_type = st.radio(
         "Quantity unit",
@@ -580,9 +618,14 @@ if selected_food is not None:
         quantity_g = unit_count * unit_weight
 
     calculated = selected_food["calories"] * quantity_g / 100
-    a, b = st.columns(2)
-    a.metric("Total quantity", f"{quantity_g:.1f} g")
-    b.metric("Calories for this quantity", f"{calculated:.1f} kcal")
+    protein_total = selected_food.get("protein", 0) * quantity_g / 100
+    carbs_total = selected_food.get("carbs", 0) * quantity_g / 100
+    fat_total = selected_food.get("fat", 0) * quantity_g / 100
+    a, b, c, d = st.columns(4)
+    a.metric("Quantity", f"{quantity_g:.1f} g")
+    b.metric("Calories", f"{calculated:.1f} kcal")
+    c.metric("Protein", f"{protein_total:.1f} g")
+    d.metric("Carbs / Fat", f"{carbs_total:.1f} / {fat_total:.1f} g")
 
     add_col, clear_col = st.columns(2)
     with add_col:
@@ -593,6 +636,9 @@ if selected_food is not None:
                     food_name=selected_food["name"],
                     calories_per_100g=selected_food["calories"],
                     quantity_g=quantity_g,
+                    protein_per_100g=selected_food.get("protein", 0),
+                    carbs_per_100g=selected_food.get("carbs", 0),
+                    fat_per_100g=selected_food.get("fat", 0),
                     quantity_type=quantity_type,
                     unit_count=unit_count,
                     unit_weight=unit_weight,
@@ -618,12 +664,29 @@ diary_day = st.date_input("View diary for", value=date.today(), key="diary_day")
 entries = get_entries(user_id, diary_day)
 
 if entries:
-    st.metric(f"Total calories on {diary_day.strftime('%d %b %Y')}",
-              f"{sum(e['calories'] for e in entries):.1f} kcal")
+    total_calories = sum(e["calories"] for e in entries)
+    total_protein = sum(e["protein_per_100g"] * e["quantity_g"] / 100 for e in entries)
+    total_carbs = sum(e["carbs_per_100g"] * e["quantity_g"] / 100 for e in entries)
+    total_fat = sum(e["fat_per_100g"] * e["quantity_g"] / 100 for e in entries)
+    st.metric(f"Total calories on {diary_day.strftime('%d %b %Y')}", f"{total_calories:.1f} kcal")
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric("Protein consumed", f"{total_protein:.1f} g")
+    mc2.metric("Carbohydrates consumed", f"{total_carbs:.1f} g")
+    mc3.metric("Fat consumed", f"{total_fat:.1f} g")
 
     for entry in entries:
-        title = f"{entry['food_name']} — {entry['quantity_g']:.0f} g — {entry['calories']:.1f} kcal"
+        ep = entry["protein_per_100g"] * entry["quantity_g"] / 100
+        ec = entry["carbs_per_100g"] * entry["quantity_g"] / 100
+        ef = entry["fat_per_100g"] * entry["quantity_g"] / 100
+        title = (f"{entry['food_name']} — {entry['quantity_g']:.0f} g — "
+                 f"{entry['calories']:.1f} kcal — P {ep:.1f} g / C {ec:.1f} g / F {ef:.1f} g")
         with st.expander(title):
+            st.caption(
+                f"Per 100 g: {entry['calories_per_100g']:.1f} kcal · "
+                f"Protein {entry['protein_per_100g']:.1f} g · "
+                f"Carbs {entry['carbs_per_100g']:.1f} g · "
+                f"Fat {entry['fat_per_100g']:.1f} g"
+            )
             st.caption(
                 f"Source: {entry['source']} · Added: "
                 f"{entry['created_at'][:16].replace('T', ' ')}"
@@ -697,6 +760,6 @@ else:
 st.divider()
 st.caption(
     "Food entries and calorie targets are stored separately for each account "
-    "in your Supabase PostgreSQL database. USDA values are estimates; manually entered "
-    "calories are supplied by the user."
+    "in your Supabase PostgreSQL database. USDA calorie and macro values are estimates; "
+    "manual calorie, protein, carbohydrate and fat values are supplied by the user."
 )
